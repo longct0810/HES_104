@@ -1,1 +1,21 @@
+# Node
+node_modules/
+
+# Environment
+.env
+.env.*
+
+# Logs
+logs/
+*.log
+
+# Runtime data
+data/runtime/
+data/spool/
+
+# Oracle Instant Client
 Certificate/instantclient_21_3/
+
+# OS / IDE
+.DS_Store
+.vscode/
