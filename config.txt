@@ -1,0 +1,6 @@
+ {"db_user": "DBA_AMI",
+"db_pass": "DBA_AMI",
+"db_connectString":"(DESCRIPTION =(ADDRESS = (PROTOCOL = TCP)(HOST = 172.16.0.101)(PORT = 1521))(CONNECT_DATA =(SID= IFC)))",
+"dir_logfile": "LogFiles/Log",
+"day_logfile": "5"
+}
