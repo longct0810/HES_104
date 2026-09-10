@@ -1,246 +1,585 @@
-const net = require("net");
-const http = require("http");
-const parser = require("./analyser.js");
-const timer = 100000;
-const fs = require("fs");
-const axios = require("axios");
-const path = require("path");
-const IEC104Client = require('./SendIEC104');
-const cambienQueue = require("./Import/queue.js");
+'use strict';
 
-//CREATE WEBSOCKET SERVER
+require('dotenv').config();
+
+const crypto = require('crypto');
+const fs = require('fs');
+const net = require('net');
 const https = require('https');
+const express = require('express');
+const axios = require('axios');
 const WebSocket = require('ws');
-const express = require("express");
+
+const parser = require('./analyser.js');
+const IEC104Client = require('./SendIEC104');
+const cambienQueue = require('./Import/queue.js');
+const IEC104FrameBuffer = require('./IEC104/frame-buffer.js');
+const ReceiveSequenceState = require('./IEC104/sequence-state.js');
+const {
+  U_FRAME,
+  parseApci,
+  buildUFrame,
+  buildSFrame,
+  buildGeneralInterrogationFrame,
+  nextSequence,
+} = require('./IEC104/apci.js');
+
+const DEVICE_REFRESH_MS = Number(process.env.DEVICE_REFRESH_MS || 100000);
+const RECONNECT_DELAY_MS = Number(process.env.IEC104_RECONNECT_DELAY_MS || 5000);
+const HEARTBEAT_MS = Number(process.env.IEC104_HEARTBEAT_MS || 20000);
+const SOCKET_IDLE_TIMEOUT_MS = Number(process.env.IEC104_SOCKET_IDLE_TIMEOUT_MS || 60000);
+const API_URL = process.env.DEVICE_API_URL || 'https://smartgrid.ifc.com.vn:6336/api/ds_thietbi_IEC_104';
+const DEFAULT_COMMON_ADDRESS = Number(process.env.IEC104_COMMON_ADDRESS || 2);
+const ORIGINATOR_ADDRESS = Number(process.env.IEC104_ORIGINATOR_ADDRESS || 1);
+
+// -----------------------------------------------------------------------------
+// WebSocket realtime server - v0.2.2 RS256 secure gateway
+// -----------------------------------------------------------------------------
+const {
+  createAuthConfig,
+  validateAuthConfig,
+  isOriginAllowed,
+  extractTicket,
+  verifyTicket,
+  WS_APPLICATION_PROTOCOL,
+} = require('./WebSocket/auth.js');
+const {
+  subscribe,
+  unsubscribe,
+  shouldReceiveTelemetry,
+} = require('./WebSocket/subscription.js');
+const {
+  loadControlPolicy,
+  validateControlRequest,
+} = require('./WebSocket/control-policy.js');
+
 const app = express();
-const port = process.env.PORT || "2022";
-// Load SSL certificates
-var privateKey = fs.readFileSync('/opt/cer/ifcssl2026-privatekey.key', 'utf8');
-var certificate = fs.readFileSync('/opt/cer/fullchain.pem', 'utf8');
-var credentials = { key: privateKey, cert: certificate };
+const sslKeyPath = process.env.SSL_KEY_PATH || '/opt/cer/ifcssl2026-privatekey.key';
+const sslCertPath = process.env.SSL_CERT_PATH || '/opt/cer/fullchain.pem';
+const websocketPort = Number(process.env.WS_PORT || 6332);
+const websocketHost = process.env.WS_HOST || '0.0.0.0';
+const websocketPath = process.env.WS_PATH || '/ws';
+const WS_MAX_PAYLOAD_BYTES = Number(process.env.WS_MAX_PAYLOAD_BYTES || 65536);
+const WS_HEARTBEAT_MS = Number(process.env.WS_HEARTBEAT_MS || 30000);
+const WS_MAX_MESSAGES_PER_MINUTE = Number(process.env.WS_MAX_MESSAGES_PER_MINUTE || 120);
+const WS_MAX_SUBSCRIPTIONS = Number(process.env.WS_MAX_SUBSCRIPTIONS || 1000);
+const WS_MAX_CLIENTS = Number(process.env.WS_MAX_CLIENTS || 200);
+const WS_MAX_CONNECTIONS_PER_IP = Number(process.env.WS_MAX_CONNECTIONS_PER_IP || 5);
+const WS_TRUST_PROXY_IPS = new Set(
+  String(process.env.WS_TRUST_PROXY_IPS || '')
+    .split(',')
+    .map((x) => normalizeIp(x.trim()))
+    .filter(Boolean)
+);
+const WS_TICKET_SINGLE_USE = String(process.env.WS_TICKET_SINGLE_USE ?? 'true').toLowerCase() !== 'false';
+const WS_SESSION_MAX_AGE_SEC = Number(process.env.WS_SESSION_MAX_AGE_SEC || 3600);
+const CONTROL_ENABLED = String(process.env.CONTROL_ENABLED ?? 'false').toLowerCase() === 'true';
 
-var httpsServer = https.createServer(credentials, app);
-httpsServer.listen(6332);
+const wsAuthConfig = createAuthConfig(process.env);
+validateAuthConfig(wsAuthConfig);
+if (!Number.isFinite(WS_SESSION_MAX_AGE_SEC) || WS_SESSION_MAX_AGE_SEC <= 0) {
+  throw new Error('WS_SESSION_MAX_AGE_SEC must be > 0');
+}
+console.log('[WS][AUTH] RS256 enabled:', {
+  issuer: wsAuthConfig.issuer,
+  audience: wsAuthConfig.audience,
+  keyId: wsAuthConfig.keyId,
+  ticketTransport: wsAuthConfig.ticketTransport,
+});
 
-var WebSocketServer = require('ws').Server;
-var wss = new WebSocketServer({
-  server: httpsServer,
-  verifyClient: (info, done) => {
-    // Cho phép tất cả origin
-    done(true);
+const controlPolicyPath = process.env.CONTROL_POINTS_PATH || './config/control-points.json';
+let controlPolicy = {};
+try {
+  controlPolicy = loadControlPolicy(controlPolicyPath);
+  if (Object.keys(controlPolicy).length === 0) {
+    console.warn(`[WS][CONTROL] No active control whitelist found at ${controlPolicyPath}. CONTROL is deny-all.`);
   }
+} catch (err) {
+  console.error('[WS][CONTROL] Cannot load control policy:', err.message);
+  throw err;
+}
+
+const httpsServer = https.createServer(
+  {
+    key: fs.readFileSync(sslKeyPath, 'utf8'),
+    cert: fs.readFileSync(sslCertPath, 'utf8'),
+  },
+  app
+);
+
+const wss = new WebSocket.Server({
+  noServer: true,
+  maxPayload: WS_MAX_PAYLOAD_BYTES,
+  perMessageDeflate: false,
+  handleProtocols(protocols) {
+    return protocols.has(WS_APPLICATION_PROTOCOL) ? WS_APPLICATION_PROTOCOL : false;
+  },
 });
 
-wss.on('connection', function connection(ws) {
-  const ip = request.socket.remoteAddress;
-  const port = request.socket.remotePort;
-  console.log('Client connected:', { ip, port });
-  
-  ws.on('message', function incoming(message) {
-    const msg = JSON.parse(message);
-    if (msg.type === 'DIEUKHIEN' && Array.isArray(msg.Data)) { //nhan ban tin dieu khien cong suat
-      const allData = msg.Data;
-      allData.forEach(row => {
-        const device_ip = row[0];
-        const device_port = row[1];
-        const device_ioa = row[2];
-        const device_value = row[3];
-        const client = new IEC104Client(device_ip, 1, device_port);
-        client.connect();
+const wsConnectionsByIp = new Map();
+const usedTicketIds = new Map();
 
-        setTimeout(() => {
-          client.sendFloatValue(device_ioa, device_value);
-        }, 500);
-      });
+function normalizeIp(ip) {
+  const value = String(ip || '').trim();
+  if (value.startsWith('::ffff:')) return value.slice(7);
+  return value;
+}
 
-    }
-    else {
-      wss.clients.forEach((client) => {
-        if (client !== ws && client.readyState === WebSocket.OPEN) {
+function getRemoteIp(request) {
+  const socketIp = normalizeIp(request?.socket?.remoteAddress) || 'unknown';
+  if (!WS_TRUST_PROXY_IPS.has(socketIp)) return socketIp;
 
-          var _data = msg;
-          client.send(JSON.stringify(_data));
-        }
-      });
-    }
-  });
+  const forwarded = String(request?.headers?.['x-forwarded-for'] || '')
+    .split(',')
+    .map((x) => normalizeIp(x))
+    .filter(Boolean);
 
-});
-const WS_URL = 'wss://smartgrid.ifc.com.vn:6332';
-const WS_RECONNECT_DELAY = 5000;
+  // Với một trusted reverse proxy cấu hình $proxy_add_x_forwarded_for,
+  // phần tử cuối là peer ngay trước proxy và không thể do client trực tiếp
+  // thay đổi nếu firewall chỉ cho proxy truy cập HES.
+  return forwarded.at(-1) || socketIp;
+}
 
-// FUNCTIONS
-let ws = null;
-let wsReady = false;
-let wsReconnectTimer = null;
+function rejectUpgrade(socket, statusCode, statusText) {
+  try {
+    socket.write(
+      `HTTP/1.1 ${statusCode} ${statusText}\r\n` +
+      'Connection: close\r\n' +
+      'Content-Type: text/plain; charset=utf-8\r\n' +
+      `Content-Length: ${Buffer.byteLength(statusText)}\r\n` +
+      '\r\n' +
+      statusText
+    );
+  } finally {
+    socket.destroy();
+  }
+}
 
-function connectWebSocket() {
-  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+httpsServer.on('upgrade', (request, socket, head) => {
+  let pathname;
+  try {
+    pathname = new URL(request.url || '/', `https://${request.headers.host || 'localhost'}`).pathname;
+  } catch {
+    rejectUpgrade(socket, 400, 'Bad Request');
     return;
   }
 
-  console.log(`[WS] Creating client -> ${WS_URL}`);
-  const socket = new WebSocket(WS_URL, { handshakeTimeout: 15000 });
-  ws = socket;
+  if (pathname !== websocketPath) {
+    rejectUpgrade(socket, 404, 'Not Found');
+    return;
+  }
 
-  socket.on('open', () => {
-    if (ws !== socket) return;
-    wsReady = true;
-    console.log(
-        `[WS] CONNECTED
-time=${new Date().toISOString()}
-readyState=${socket.readyState}`
-    );
+  const origin = request.headers.origin || '';
+  if (!isOriginAllowed(origin, wsAuthConfig)) {
+    console.warn('[WS][AUTH] Rejected origin:', origin || '<missing>');
+    rejectUpgrade(socket, 403, 'Forbidden');
+    return;
+  }
+
+  if (wss.clients.size >= WS_MAX_CLIENTS) {
+    rejectUpgrade(socket, 503, 'WebSocket capacity reached');
+    return;
+  }
+
+  const ip = getRemoteIp(request);
+  const currentIpConnections = wsConnectionsByIp.get(ip) || 0;
+  if (WS_MAX_CONNECTIONS_PER_IP > 0 && currentIpConnections >= WS_MAX_CONNECTIONS_PER_IP) {
+    console.warn('[WS][AUTH] Connection limit exceeded:', { ip });
+    rejectUpgrade(socket, 429, 'Too Many Requests');
+    return;
+  }
+
+  let principal;
+  try {
+    const ticket = extractTicket(request, wsAuthConfig);
+    principal = verifyTicket(ticket, wsAuthConfig);
+
+    if (WS_TICKET_SINGLE_USE) {
+      if (!principal.tokenId) {
+        throw new Error('Single-use WebSocket tickets require jti');
+      }
+      if (usedTicketIds.has(principal.tokenId)) {
+        throw new Error('WebSocket ticket has already been used');
+      }
+      usedTicketIds.set(principal.tokenId, Number(principal.expiresAt) * 1000);
+    }
+  } catch (err) {
+    console.warn('[WS][AUTH] Rejected ticket:', { ip, reason: err.message });
+    rejectUpgrade(socket, 401, 'Unauthorized');
+    return;
+  }
+
+  request.wsPrincipal = principal;
+  request.wsRemoteIp = ip;
+
+  wss.handleUpgrade(request, socket, head, (ws) => {
+    wss.emit('connection', ws, request);
   });
+});
 
-  socket.on('close', (code, reason) => {
-    if (ws !== socket) return;
-    wsReady = false;
-    ws = null;
-    console.warn(`[WS] CLOSED code=${code} reason=${reason.toString()}`);
-    scheduleWebSocketReconnect();
-  });
+wss.on('connection', (ws, request) => {
+  const ip = request.wsRemoteIp || getRemoteIp(request);
+  const principal = request.wsPrincipal;
 
-  socket.on('error', (err) => {
+  ws.principal = principal;
+  ws.remoteIp = ip;
+  ws.subscriptions = new Set();
+  ws.isAlive = true;
+  ws.rateWindowStartedAt = Date.now();
+  ws.rateWindowMessages = 0;
+  ws.sessionExpiryTimer = null;
+  ws.connectedAt = Date.now();
 
-    console.error(`
-================ WS ERROR ================
-time       : ${new Date().toISOString()}
-message    : ${err.message}
-code       : ${err.code}
-errno      : ${err.errno}
-syscall    : ${err.syscall}
-hostname   : ${err.hostname}
-stack:
-${err.stack}
-==========================================
-`);
-    if (ws === socket && socket.readyState !== WebSocket.CLOSED) socket.terminate();
-  });
-}
-
-function scheduleWebSocketReconnect() {
-  if (wsReconnectTimer) return;
-  wsReconnectTimer = setTimeout(() => {
-    wsReconnectTimer = null;
-    connectWebSocket();
-  }, WS_RECONNECT_DELAY);
-}
-
-connectWebSocket();
-
-function sendToWS(data) {
-  if (wsReady && ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(data));
+  // v0.2.2: ticket exp chỉ giới hạn thời gian dùng cho handshake.
+  // WebSocket session có lifetime riêng để không buộc client reconnect mỗi 120 giây.
+  if (Number.isFinite(WS_SESSION_MAX_AGE_SEC) && WS_SESSION_MAX_AGE_SEC > 0) {
+    ws.sessionExpiresAt = ws.connectedAt + (WS_SESSION_MAX_AGE_SEC * 1000);
+    ws.sessionExpiryTimer = setTimeout(() => {
+      if (ws.readyState === WebSocket.OPEN) ws.close(1000, 'Session renewal required');
+    }, WS_SESSION_MAX_AGE_SEC * 1000);
+    ws.sessionExpiryTimer.unref?.();
   } else {
-    console.warn('WebSocket chưa sẵn sàng, không gửi được dữ liệu.');
+    ws.sessionExpiresAt = null;
+  }
+
+  wsConnectionsByIp.set(ip, (wsConnectionsByIp.get(ip) || 0) + 1);
+
+  console.log('[WS] Authenticated client connected:', {
+    ip,
+    userId: principal.userId,
+    role: principal.role,
+  });
+
+  sendJson(ws, {
+    type: 'READY',
+    userId: principal.userId,
+    role: principal.role,
+    ticketExpiresAt: principal.expiresAt,
+    sessionExpiresAt: ws.sessionExpiresAt ? Math.floor(ws.sessionExpiresAt / 1000) : null,
+  });
+
+  ws.on('pong', () => {
+    ws.isAlive = true;
+  });
+
+  ws.on('message', (message) => {
+    if (!allowIncomingMessage(ws)) {
+      console.warn('[WS][RATE] Client exceeded message limit:', { ip, userId: principal.userId });
+      sendError(ws, 'RATE_LIMITED', 'Too many WebSocket messages');
+      ws.close(1008, 'Rate limit exceeded');
+      return;
+    }
+
+    let msg;
+    try {
+      msg = JSON.parse(message.toString());
+    } catch {
+      sendError(ws, 'INVALID_JSON', 'Message must be valid JSON');
+      return;
+    }
+
+    handleWsMessage(ws, msg);
+  });
+
+  ws.on('close', () => {
+    if (ws.sessionExpiryTimer) clearTimeout(ws.sessionExpiryTimer);
+
+    const current = wsConnectionsByIp.get(ip) || 0;
+    if (current <= 1) wsConnectionsByIp.delete(ip);
+    else wsConnectionsByIp.set(ip, current - 1);
+
+    console.log('[WS] Client disconnected:', { ip, userId: principal.userId });
+  });
+
+  ws.on('error', (err) => {
+    console.warn('[WS] Client error:', { ip, userId: principal.userId, error: err.message });
+  });
+});
+
+function allowIncomingMessage(ws) {
+  const now = Date.now();
+  if (now - ws.rateWindowStartedAt >= 60000) {
+    ws.rateWindowStartedAt = now;
+    ws.rateWindowMessages = 0;
+  }
+
+  ws.rateWindowMessages += 1;
+  return ws.rateWindowMessages <= WS_MAX_MESSAGES_PER_MINUTE;
+}
+
+function handleWsMessage(ws, msg) {
+  if (!msg || typeof msg !== 'object' || Array.isArray(msg)) {
+    sendError(ws, 'INVALID_MESSAGE', 'Message must be a JSON object');
+    return;
+  }
+
+  switch (msg.type) {
+    case 'PING':
+      sendJson(ws, { type: 'PONG', time: new Date().toISOString() });
+      return;
+
+    case 'SUBSCRIBE': {
+      const result = subscribe(ws, msg.devices, WS_MAX_SUBSCRIPTIONS);
+      if (!result.ok) {
+        sendError(ws, result.code, result.message, { denied: result.denied });
+        return;
+      }
+      sendJson(ws, { type: 'SUBSCRIBED', devices: result.devices });
+      return;
+    }
+
+    case 'UNSUBSCRIBE': {
+      const result = unsubscribe(ws, msg.devices);
+      sendJson(ws, { type: 'SUBSCRIBED', devices: result.devices });
+      return;
+    }
+
+    case 'CONTROL':
+      handleControlMessage(ws, msg);
+      return;
+
+    // Legacy command format intentionally disabled in v0.2.1 because it lets
+    // the remote client choose RTU IP/port directly.
+    case 'DIEUKHIEN':
+      sendError(ws, 'LEGACY_CONTROL_DISABLED', 'Use CONTROL with deviceId, ioa and value');
+      return;
+
+    default:
+      // v0.2.0 relayed arbitrary client messages to every other client.
+      // v0.2.1 explicitly forbids client-to-client relay.
+      sendError(ws, 'UNSUPPORTED_MESSAGE_TYPE', 'Unsupported WebSocket message type');
   }
 }
 
+function handleControlMessage(ws, msg) {
+  if (!CONTROL_ENABLED) {
+    sendError(ws, 'CONTROL_DISABLED', 'IEC-104 control is disabled on this HES');
+    return;
+  }
 
+  const validation = validateControlRequest(ws.principal, msg, controlPolicy);
+  if (!validation.ok) {
+    console.warn('[WS][CONTROL] Rejected:', {
+      userId: ws.principal.userId,
+      ip: ws.remoteIp,
+      deviceId: msg?.deviceId,
+      ioa: msg?.ioa,
+      reason: validation.code,
+    });
+    sendError(ws, validation.code, validation.message, { requestId: msg?.requestId || null });
+    return;
+  }
 
+  const command = validation.command;
+  const device = findDeviceById(command.deviceId);
+  if (!device || !device.ip || !device.port) {
+    sendError(ws, 'DEVICE_OFFLINE_OR_UNKNOWN', 'Device is not present in the active HES registry', {
+      requestId: command.requestId,
+    });
+    return;
+  }
 
-const data = {
-  v_userid: 1,
-};
-let arr_ipAddresses = [];
-const ipAddConnected = [];
-const clients = [];
+  const commonAddress = command.commonAddress ?? Number(
+    device.common_address ??
+    device.commonAddress ??
+    device.ca ??
+    DEFAULT_COMMON_ADDRESS
+  );
+
+  console.warn('[WS][CONTROL] Accepted command:', {
+    userId: ws.principal.userId,
+    ip: ws.remoteIp,
+    deviceId: command.deviceId,
+    ioa: command.ioa,
+    value: command.value,
+    requestId: command.requestId,
+  });
+
+  try {
+    const commandClient = new IEC104Client(device.ip, commonAddress, Number(device.port));
+    commandClient.connect();
+    setTimeout(() => commandClient.sendFloatValue(command.ioa, command.value), 500);
+
+    sendJson(ws, {
+      type: 'CONTROL_ACCEPTED',
+      requestId: command.requestId,
+      deviceId: command.deviceId,
+      ioa: command.ioa,
+    });
+  } catch (err) {
+    console.error('[WS][CONTROL] Command send failed:', err.message);
+    sendError(ws, 'CONTROL_SEND_FAILED', 'HES could not start the IEC-104 command session', {
+      requestId: command.requestId,
+    });
+  }
+}
+
+function findDeviceById(deviceId) {
+  return arrIpAddresses.find((device) => String(device.id_thietbi) === String(deviceId)) || null;
+}
+
+function sendJson(ws, data) {
+  if (ws.readyState !== WebSocket.OPEN) return false;
+  ws.send(JSON.stringify(data));
+  return true;
+}
+
+function sendError(ws, code, message, extra = {}) {
+  sendJson(ws, {
+    type: 'ERROR',
+    code,
+    message,
+    ...extra,
+  });
+}
+
+function sendToWS(data) {
+  if (!Array.isArray(data) || data.length === 0) return;
+
+  for (const client of wss.clients) {
+    if (client.readyState !== WebSocket.OPEN) continue;
+
+    const filtered = data.filter((row) => {
+      const deviceId = Array.isArray(row) ? row[1] : null;
+      return deviceId !== null && deviceId !== undefined && shouldReceiveTelemetry(client, deviceId);
+    });
+
+    if (filtered.length > 0) {
+      // Giữ payload telemetry dạng array của HES cũ để giảm thay đổi frontend.
+      client.send(JSON.stringify(filtered));
+    }
+  }
+}
+
+const wsHeartbeat = setInterval(() => {
+  const now = Date.now();
+  for (const [ticketId, expiresAtMs] of usedTicketIds.entries()) {
+    if (expiresAtMs + 60000 < now) usedTicketIds.delete(ticketId);
+  }
+
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) {
+      ws.terminate();
+      continue;
+    }
+    ws.isAlive = false;
+    ws.ping();
+  }
+}, WS_HEARTBEAT_MS);
+wsHeartbeat.unref();
+
+httpsServer.listen(websocketPort, websocketHost, () => {
+  console.log(`[WS] Secure HTTPS/WebSocket server listening on ${websocketHost}:${websocketPort}${websocketPath}`);
+});
+
+// -----------------------------------------------------------------------------
+// IEC-104 device manager
+// -----------------------------------------------------------------------------
+const requestData = { v_userid: 1 };
+let arrIpAddresses = [];
 const connectionMap = new Map();
 
 startAutoRefresh();
+
 function startAutoRefresh() {
-  // gọi lần đầu
-  get_connect();
-  // gọi định kỳ
+  getConnect();
   setInterval(() => {
-    console.log("REFRESH DEVICE LIST...");
-    get_connect();
-  }, timer);
+    console.log('REFRESH DEVICE LIST...');
+    getConnect();
+  }, DEVICE_REFRESH_MS);
 }
 
 function deviceKey(device) {
   return `${device.ip}:${device.port}`;
 }
 
-function get_connect() {
-  console.log("RELOAD DEVICE LIST...");
+async function getConnect() {
+  console.log('RELOAD DEVICE LIST...');
 
-  axios.post("https://smartgrid.ifc.com.vn:6336/api/ds_thietbi_IEC_104", data)
-    .then((res) => {
-      const latestDevices = [];
+  try {
+    const res = await axios.post(API_URL, requestData);
+    const latestDevices = [];
 
-      res.data.forEach((device) => {
-        try {
-          const obj = JSON.parse(device[0]);
-          obj.index = 0;
-          latestDevices.push(obj);
-        } catch (e) {
-          console.error("Parse error:", e);
-        }
-      });
+    for (const device of res.data || []) {
+      try {
+        const obj = typeof device?.[0] === 'string' ? JSON.parse(device[0]) : device;
+        if (!obj || !obj.ip || !obj.port) continue;
+        obj.index = 0;
+        latestDevices.push(obj);
+      } catch (err) {
+        console.error('Parse device error:', err.message);
+      }
+    }
 
-      arr_ipAddresses = latestDevices;
-
-      syncConnections(latestDevices);
-    })
-    .catch((err) => {
-      console.error("get_connect error:", err);
-    });
+    arrIpAddresses = latestDevices;
+    syncConnections(latestDevices);
+  } catch (err) {
+    console.error('get_connect error:', err.message);
+  }
 }
 
 function syncConnections(latestDevices) {
   const latestKeys = new Set(latestDevices.map(deviceKey));
 
-  // 1) add mới
-  latestDevices.forEach((device) => {
+  for (const device of latestDevices) {
     const key = deviceKey(device);
     const existing = connectionMap.get(key);
 
     if (!existing) {
       console.log(`ADD NEW DEVICE: ${key}`);
       connectToHardwareDevice(device);
-      return;
+      continue;
     }
 
-    // cập nhật lại metadata mới nhất nếu API đổi name/id_thietbi...
     existing.device = device;
-  });
+  }
 
-  // 2) remove device không còn tồn tại trong API
-  for (const [key, conn] of connectionMap.entries()) {
+  for (const [key] of connectionMap.entries()) {
     if (!latestKeys.has(key)) {
       console.log(`REMOVE DEVICE: ${key}`);
-      destroyConnection(key, false); // false = không reconnect nữa
+      destroyConnection(key, false);
     }
   }
 }
 
+function createConnectionState(device) {
+  return {
+    device,
+    client: null,
+    heartbeat: null,
+    reconnectTimer: null,
+    connecting: false,
+    frameBuffer: new IEC104FrameBuffer(),
+    receiveSequence: new ReceiveSequenceState(0),
+    sendSeq: 0,
+    peerAckSeq: 0,
+    started: false,
+    giSent: false,
+  };
+}
 
-function connectToHardwareDevice(ipAddress) {
-  const key = deviceKey(ipAddress);
+function connectToHardwareDevice(device) {
+  const key = deviceKey(device);
   const existing = connectionMap.get(key);
 
   if (existing?.connecting) {
     console.log(`SKIP connecting, đang kết nối: ${key}`);
     return;
   }
-
   if (existing?.client && !existing.client.destroyed) {
     console.log(`SKIP connected: ${key}`);
     return;
   }
 
-  const state = existing || {
-    device:ipAddress,
-    client: null,
-    heartbeat: null,
-    reconnectTimer: null,
-    connecting: false,
-  };
-
-  state.device = ipAddress;
+  const state = existing || createConnectionState(device);
+  state.device = device;
   state.connecting = true;
+  state.frameBuffer.reset();
+  state.receiveSequence.reset(0);
+  state.sendSeq = 0;
+  state.peerAckSeq = 0;
+  state.started = false;
+  state.giSent = false;
 
   if (state.reconnectTimer) {
     clearTimeout(state.reconnectTimer);
@@ -250,106 +589,207 @@ function connectToHardwareDevice(ipAddress) {
   connectionMap.set(key, state);
 
   const client = net.createConnection(
-    { host: ipAddress.ip, port: ipAddress.port },
+    { host: device.ip, port: Number(device.port) },
     () => {
-      console.log(`Connected to ${key}`);
       if (state.client !== client) {
         client.destroy();
         return;
       }
-      state.connecting = false;
 
-      client.write(hexStringToByte("680407000000"));
+      state.connecting = false;
+      console.log(`Connected to ${key}`);
+      safeWrite(client, buildUFrame(U_FRAME.STARTDT_ACT), key);
 
       state.heartbeat = setInterval(() => {
         if (!client.destroyed) {
-          client.write(hexStringToByte("680443000000"));
+          safeWrite(client, buildUFrame(U_FRAME.TESTFR_ACT), key);
         }
-      }, 20000);
+      }, HEARTBEAT_MS);
     }
   );
-  state.client = client;
-  // Thiết lập timeout là 5 giây (5000ms)
-  client.setTimeout(15000);
 
-  client.on("timeout", () => {
-    console.log(`Connection timed out: ${key}`);
+  state.client = client;
+  client.setTimeout(SOCKET_IDLE_TIMEOUT_MS);
+
+  client.on('timeout', () => {
+    console.warn(`Connection idle timeout: ${key}`);
     client.destroy();
   });
 
-
-  client.on("data", (data) => {
-    var checkData = getAckNrFromDeviceApdu(data);
-    if (checkData.success && checkData.message != 'U-Frame parsed') {
-      var tenthietbi = "";
-      var idthietbi = "";
-      for (k = 0; k < arr_ipAddresses.length; k++) {
-        var info = arr_ipAddresses[k];
-        if (info.ip == ipAddress.ip && info.port == ipAddress.port) {
-          tenthietbi = arr_ipAddresses[k].name;
-          idthietbi = arr_ipAddresses[k].id_thietbi;
-        }
-      }
-      var result = parser.analyser(data.toString("hex"), tenthietbi, idthietbi);
-      if (result.Data && result.Data.length > 0) {
-        cambienQueue.add(
-          { dataArray: result.Data },
-          {
-            jobId: `sensor-${Date.now()}`,
-            attempts: 3, // Retry 3 lần nếu lỗi
-            backoff: { type: "fixed", delay: 5000 }, // mỗi lần retry cách nhau 5s
-          }
-        );
-	      console.log(result.Data);
-        sendToWS(result.Data);
-      }
-      var supervisory = buildSFrame(checkData.data.ackNr);
-      client.write(supervisory); //supervisory
+  client.on('data', (chunk) => {
+    let frames;
+    try {
+      frames = state.frameBuffer.push(chunk);
+    } catch (err) {
+      console.error(`[IEC104][FRAME_BUFFER] ${key}:`, err.message);
+      client.destroy();
+      return;
     }
-    else {
-      var type_msg = getTypemsg(data.toString("hex"));
-      switch (type_msg) {
-        case "Test Frame Activation":
-          //console.log('test frame ' + '=> 680483000000')
-          client.write(hexStringToByte("680483000000"));
-          break;
-        case "Start Data Transfer Activation":
-          //console.log('start data transfer ' + '=> 68040B000000')
-          client.write(hexStringToByte("680e0000000064010601020000000014"));
-          break;
-        case "Stop Data Transfer Activation":
-          //console.log('stop data transfer ' + '=> 680423000000')
-          client.write(hexStringToByte("680423000000"));
-          break;
+
+    for (const apdu of frames) {
+      try {
+        handleApdu(state, client, key, apdu);
+      } catch (err) {
+        // Một frame lỗi không được làm chết toàn bộ HES. TCP session vẫn được giữ
+        // để các frame kế tiếp có thể tiếp tục xử lý.
+        console.error(`[IEC104][APDU] ${key}:`, err.message, apdu.toString('hex'));
       }
     }
   });
-  client.on("close", () => {
+
+  client.on('close', () => {
     console.log(`Socket closed: ${key}`);
     if (state.client !== client) return;
+
     cleanupConnectionResources(key, client);
-    // chỉ reconnect nếu device vẫn còn trong danh sách API hiện tại
-    if (isDeviceStillActive(key)) {
-      scheduleReconnect(key);
-    } else {
-      connectionMap.delete(key);
-    }
+    if (isDeviceStillActive(key)) scheduleReconnect(key);
+    else connectionMap.delete(key);
   });
-  client.on("end", () => {
+
+  client.on('end', () => {
     console.log(`Disconnected from ${key}`);
     if (!client.destroyed) client.destroy();
   });
-  client.on("error", (err) => {
+
+  client.on('error', (err) => {
     console.error(`Socket error ${key}:`, err.message);
     if (!client.destroyed) client.destroy();
   });
 }
+
+function handleApdu(state, client, key, apdu) {
+  const apci = parseApci(apdu);
+
+  if (apci.type === 'U') {
+    handleUFrame(state, client, key, apci);
+    return;
+  }
+
+  if (apci.type === 'S') {
+    state.peerAckSeq = apci.nr;
+    return;
+  }
+
+  state.peerAckSeq = apci.nr;
+
+  const sequence = state.receiveSequence.accept(apci.ns);
+  if (sequence.status === 'duplicate') {
+    safeWrite(client, buildSFrame(state.receiveSequence.expected), key);
+    return;
+  }
+
+  if (sequence.status === 'gap') {
+    console.warn(
+      `[IEC104][SEQ] ${key} sequence gap: received=${sequence.received}, expected=${sequence.expectedBefore}. ` +
+      `Resynced expected=${sequence.expectedAfter}.`
+    );
+  }
+
+  const device = state.device;
+  const result = parser.analyser(apdu, device.name || '', device.id_thietbi || '');
+
+  if (result.Data && result.Data.length > 0) {
+    const jobId = `sensor-${device.id_thietbi || 'unknown'}-${crypto.randomUUID()}`;
+
+    cambienQueue.add(
+      { dataArray: result.Data },
+      {
+        jobId,
+        attempts: 3,
+        backoff: { type: 'fixed', delay: 5000 },
+        removeOnComplete: 1000,
+        removeOnFail: 5000,
+      }
+    ).catch((err) => {
+      console.error(`[QUEUE] Cannot enqueue ${jobId}:`, err.message);
+    });
+
+    sendToWS(result.Data);
+  }
+
+  // v0.2.0 ACK mỗi I-frame để ưu tiên reliability. Có thể tối ưu theo IEC k/w
+  // window ở phiên bản throughput tuning sau.
+  safeWrite(client, buildSFrame(state.receiveSequence.expected), key);
+}
+
+function handleUFrame(state, client, key, apci) {
+  switch (apci.code) {
+    case U_FRAME.TESTFR_ACT:
+      safeWrite(client, buildUFrame(U_FRAME.TESTFR_CON), key);
+      break;
+
+    case U_FRAME.TESTFR_CON:
+      break;
+
+    case U_FRAME.STARTDT_ACT:
+      state.started = true;
+      safeWrite(client, buildUFrame(U_FRAME.STARTDT_CON), key);
+      sendGeneralInterrogation(state, client, key);
+      break;
+
+    case U_FRAME.STARTDT_CON:
+      state.started = true;
+      sendGeneralInterrogation(state, client, key);
+      break;
+
+    case U_FRAME.STOPDT_ACT:
+      state.started = false;
+      safeWrite(client, buildUFrame(U_FRAME.STOPDT_CON), key);
+      break;
+
+    case U_FRAME.STOPDT_CON:
+      state.started = false;
+      break;
+
+    default:
+      console.warn(`[IEC104][U] ${key}: unsupported ${apci.name}`);
+  }
+}
+
+function sendGeneralInterrogation(state, client, key) {
+  if (state.giSent) return;
+
+  const device = state.device || {};
+  const commonAddress = Number(
+    device.common_address ??
+    device.commonAddress ??
+    device.ca ??
+    DEFAULT_COMMON_ADDRESS
+  );
+
+  const frame = buildGeneralInterrogationFrame({
+    ns: state.sendSeq,
+    nr: state.receiveSequence.expected,
+    commonAddress,
+    originatorAddress: ORIGINATOR_ADDRESS,
+  });
+
+  if (safeWrite(client, frame, key)) {
+    console.log(`[IEC104] GI sent ${key}, CA=${commonAddress}, NS=${state.sendSeq}, NR=${state.receiveSequence.expected}`);
+    state.sendSeq = nextSequence(state.sendSeq);
+    state.giSent = true;
+  }
+}
+
+function safeWrite(client, data, key) {
+  if (!client || client.destroyed || !client.writable) return false;
+  try {
+    client.write(data);
+    return true;
+  } catch (err) {
+    console.error(`[IEC104][WRITE] ${key}:`, err.message);
+    return false;
+  }
+}
+
 function cleanupConnectionResources(key, client) {
   const state = connectionMap.get(key);
-  if (!state) return;
-  if (client && state.client !== client) return;
+  if (!state || (client && state.client !== client)) return;
 
   state.connecting = false;
+  state.started = false;
+  state.giSent = false;
+  state.frameBuffer.reset();
 
   if (state.heartbeat) {
     clearInterval(state.heartbeat);
@@ -358,14 +798,12 @@ function cleanupConnectionResources(key, client) {
 
   state.client = null;
 }
-function scheduleReconnect(key, delay = 5000) {
-  const state = connectionMap.get(key);
-  if (!state) return;
 
-  if (state.reconnectTimer) return;
+function scheduleReconnect(key, delay = RECONNECT_DELAY_MS) {
+  const state = connectionMap.get(key);
+  if (!state || state.reconnectTimer) return;
 
   console.log(`Reconnect after ${delay}ms: ${key}`);
-
   state.reconnectTimer = setTimeout(() => {
     state.reconnectTimer = null;
 
@@ -373,6 +811,7 @@ function scheduleReconnect(key, delay = 5000) {
       connectionMap.delete(key);
       return;
     }
+
     connectToHardwareDevice(state.device);
   }, delay);
 }
@@ -381,133 +820,33 @@ function destroyConnection(key, shouldReconnect = false) {
   const state = connectionMap.get(key);
   if (!state) return;
 
-  if (state.reconnectTimer) {
-    clearTimeout(state.reconnectTimer);
-    state.reconnectTimer = null;
-  }
-
-  if (state.heartbeat) {
-    clearInterval(state.heartbeat);
-    state.heartbeat = null;
-  }
+  if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
+  if (state.heartbeat) clearInterval(state.heartbeat);
 
   const client = state.client;
   state.client = null;
   state.connecting = false;
+  state.reconnectTimer = null;
+  state.heartbeat = null;
 
-  if (client && !client.destroyed) {
-    client.destroy();
-  }
-
-  if (!shouldReconnect) {
-    connectionMap.delete(key);
-  }
+  if (client && !client.destroyed) client.destroy();
+  if (!shouldReconnect) connectionMap.delete(key);
 }
 
 function isDeviceStillActive(key) {
-  return arr_ipAddresses.some((d) => deviceKey(d) === key);
-}
-function buildSFrame(ackNr) {
-  const nr = ackNr & 0x7fff;
-  const enc = nr << 1;
-
-  const buf = Buffer.alloc(6);
-  buf[0] = 0x68;
-  buf[1] = 0x04;
-  buf[2] = 0x01;
-  buf[3] = 0x00;
-  buf.writeUInt16LE(enc, 4); // C3,C4 carry N(R)<<1
-  return buf;
-}
-function getAckNrFromDeviceApdu(apdu) {
-  try {
-    const b = Buffer.isBuffer(apdu)
-      ? apdu
-      : Buffer.from(String(apdu).replace(/\s+/g, ""), "hex");
-
-    if (b.length < 6) {
-      return { success: false, message: "APDU too short", data: null };
-    }
-
-    if (b[0] !== 0x68) {
-      return { success: false, message: "Invalid IEC-104 start byte", data: null };
-    }
-
-    const len = b[1];
-    const total = 2 + len;
-
-    if (b.length < total) {
-      return { success: false, message: "Truncated APDU", data: null };
-    }
-
-    const c1 = b[2];
-    const c2 = b[3];
-    const c3 = b[4];
-    const c4 = b[5];
-
-    const isI = (c1 & 0x01) === 0;
-    const isS = (c1 & 0x03) === 0x01;
-    const isU = (c1 & 0x03) === 0x03;
-
-    if (isI) {
-      const ns = (((c2 << 8) | c1) >> 1) & 0x7fff;
-      const nr = (((c4 << 8) | c3) >> 1) & 0x7fff;
-      const ackNr = (ns + 1) & 0x7fff;
-
-      return {
-        success: true,
-        message: "I-Frame parsed",
-        data: { isI, isS, isU, ns, nr, ackNr }
-      };
-    }
-
-    if (isS) {
-      const nr = (((c4 << 8) | c3) >> 1) & 0x7fff;
-
-      return {
-        success: true,
-        message: "S-Frame parsed",
-        data: { isI, isS, isU, nr, ackNr: nr }
-      };
-    }
-
-    return {
-      success: true,
-      message: "U-Frame parsed",
-      data: { isI, isS, isU }
-    };
-
-  } catch (err) {
-    return {
-      success: false,
-      message: err.message,
-      data: null
-    };
-  }
-}
-function getTypemsg(data) {
-  var msgType = data.substr(4, 2);
-  switch (msgType) {
-    case "43":
-      return "Test Frame Activation";
-    case "0b":
-      return "Start Data Transfer Activation";
-    case "13":
-      return "Stop Data Transfer Activation";
-  }
+  return arrIpAddresses.some((device) => deviceKey(device) === key);
 }
 
-function hexStringToByte(str) {
-  if (!str) {
-    return new Uint8Array();
+function shutdown(signal) {
+  console.log(`[SYSTEM] ${signal} received, closing IEC104 sessions...`);
+  clearInterval(wsHeartbeat);
+  for (const key of [...connectionMap.keys()]) {
+    destroyConnection(key, false);
   }
 
-  var a = [];
-  for (var i = 0, len = str.length; i < len; i += 2) {
-    a.push(parseInt(str.substr(i, 2), 16));
-  }
-
-  return new Uint8Array(a);
+  httpsServer.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 5000).unref();
 }
 
-
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));

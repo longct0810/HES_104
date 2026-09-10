@@ -17,12 +17,15 @@ const CHUNK_SIZE = 1000;
 
 async function initPool() {
   try {
+    const required = ['ORACLE_DB_USER', 'ORACLE_DB_PASS', 'ORACLE_DB_CONNECT'];
+    const missing = required.filter((key) => !process.env[key]);
+    if (missing.length) {
+      throw new Error(`Thiếu cấu hình Oracle legacy: ${missing.join(', ')}`);
+    }
     pool = await oracledb.createPool({
-      user: process.env.DB_USER || 'SMARTGRID',
-      password: process.env.DB_PASS || 'SMARTGRID',
-      connectString:
-        process.env.DB_CONNECT ||
-        '(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=10.21.12.84)(PORT=1521))(CONNECT_DATA=(SID=IFC)))',
+      user: process.env.ORACLE_DB_USER,
+      password: process.env.ORACLE_DB_PASS,
+      connectString: process.env.ORACLE_DB_CONNECT,
       poolMin: Number(process.env.DB_POOL_MIN || 1),
       poolMax: Number(process.env.DB_POOL_MAX || 20),
       poolIncrement: Number(process.env.DB_POOL_INC || 1),
