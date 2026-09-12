@@ -4,6 +4,7 @@ module.exports = {
   apps: [
     {
       name: 'hes-iec104',
+      cwd: __dirname,
       script: './index.js',
       autorestart: true,
       restart_delay: 3000,
@@ -12,6 +13,7 @@ module.exports = {
     },
     {
       name: 'hes-db-worker',
+      cwd: __dirname,
       script: './Import/worker.js',
       autorestart: true,
       restart_delay: 3000,
@@ -20,6 +22,7 @@ module.exports = {
     },
     {
       name: 'hes-log-cleaner',
+      cwd: __dirname,
       script: './Files/clean-file.js',
       autorestart: true,
       restart_delay: 5000,

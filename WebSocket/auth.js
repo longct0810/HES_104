@@ -41,7 +41,7 @@ function createAuthConfig(env = process.env) {
 
   let publicKey = null;
   if (publicKeyPath) {
-    const absolutePath = path.resolve(publicKeyPath);
+    const absolutePath = path.resolve(__dirname, '..', publicKeyPath);
     const pem = fs.readFileSync(absolutePath, 'utf8');
     publicKey = validateRsaPublicKey(pem, 2048);
   }

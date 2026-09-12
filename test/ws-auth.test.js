@@ -82,7 +82,7 @@ test('ticket được lấy từ Sec-WebSocket-Protocol, không cần query stri
   const request = {
     url: '/ws',
     headers: {
-      host: 'hes104.ifc.com.vn:6332',
+      host: 'smartgrid.ifc.com.vn:6332',
       'sec-websocket-protocol': `${WS_APPLICATION_PROTOCOL}, ticket.${value}`,
     },
   };
@@ -102,7 +102,7 @@ test('legacy query ticket mặc định bị từ chối', () => {
   const config = createAuthConfig(BASE_ENV);
   const request = {
     url: `/ws?ticket=${encodeURIComponent(ticket())}`,
-    headers: { host: 'hes104.ifc.com.vn:6332' },
+    headers: { host: 'smartgrid.ifc.com.vn:6332' },
   };
   assert.throws(() => extractTicket(request, config), /subprotocol/);
 });
