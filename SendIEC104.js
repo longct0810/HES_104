@@ -28,6 +28,23 @@ class IEC104Client {
     });
   }
 
+  sendSingleCommand(ioa, val) {
+    if (!Number.isInteger(ioa) || ioa < 0 || ioa > 0xFFFFFF || (val !== 0 && val !== 1)) throw new Error('Invalid single command');
+    const buf = Buffer.alloc(16);
+    buf[0] = 0x68;
+    buf[1] = 14;
+    buf.writeUInt16LE(this.sendSeq << 1, 2);
+    buf.writeUInt16LE(this.recvSeq << 1, 4);
+    this.sendSeq++;
+    buf[6] = 45; // C_SC_NA_1
+    buf[7] = 1;
+    buf.writeUInt16LE(6, 8); // activation
+    buf.writeUInt16LE(this.ca, 10);
+    buf.writeUIntLE(ioa, 12, 3);
+    buf[15] = val; // execute, QU=0
+    this.socket.write(buf);
+  }
+
   sendFloatValue(ioa, val) {
     const buf = Buffer.alloc(6 + 1 + 1 + 2 + 2 + 3 + 4 + 1);
     let off = 0;

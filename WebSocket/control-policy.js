@@ -40,9 +40,12 @@ function validateControlRequest(principal, message, policy) {
   }
 
   const type = String(point.type || 'C_SE_NC_1');
-  if (type !== 'C_SE_NC_1') {
+  if (!['C_SE_NC_1', 'C_SC_NA_1'].includes(type)) {
     return { ok: false, code: 'UNSUPPORTED_CONTROL_TYPE', message: `Unsupported control type ${type}` };
   }
+
+  if (message.commandType && message.commandType !== type) return { ok: false, code: 'CONTROL_TYPE_MISMATCH', message: 'Command type does not match control policy' };
+  if (type === 'C_SC_NA_1' && value !== 0 && value !== 1) return { ok: false, code: 'VALUE_OUT_OF_RANGE', message: 'Single command requires 0 or 1' };
 
   if (Number.isFinite(Number(point.min)) && value < Number(point.min)) {
     return { ok: false, code: 'VALUE_OUT_OF_RANGE', message: `Value is below minimum ${point.min}` };

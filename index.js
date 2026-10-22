@@ -48,10 +48,7 @@ const {
   unsubscribe,
   shouldReceiveTelemetry,
 } = require('./WebSocket/subscription.js');
-const {
-  loadControlPolicy,
-  validateControlRequest,
-} = require('./WebSocket/control-policy.js');
+const { validateDatabaseControlRequest } = require('./WebSocket/control-policy-db.js');
 
 const app = express();
 const sslKeyPath = process.env.SSL_KEY_PATH || '/opt/cer/ifcssl2026-privatekey.key';
@@ -87,17 +84,7 @@ console.log('[WS][AUTH] RS256 enabled:', {
   ticketTransport: wsAuthConfig.ticketTransport,
 });
 
-const controlPolicyPath = process.env.CONTROL_POINTS_PATH || './config/control-points.json';
-let controlPolicy = {};
-try {
-  controlPolicy = loadControlPolicy(controlPolicyPath);
-  if (Object.keys(controlPolicy).length === 0) {
-    console.warn(`[WS][CONTROL] No active control whitelist found at ${controlPolicyPath}. CONTROL is deny-all.`);
-  }
-} catch (err) {
-  console.error('[WS][CONTROL] Cannot load control policy:', err.message);
-  throw err;
-}
+console.log('[WS][CONTROL] Whitelist source: PostgreSQL public.hes_control_points (per command)');
 
 const httpsServer = https.createServer(
   {
@@ -351,13 +338,14 @@ function handleWsMessage(ws, msg) {
   }
 }
 
-function handleControlMessage(ws, msg) {
+async function handleControlMessage(ws, msg) {
   if (!CONTROL_ENABLED) {
     sendError(ws, 'CONTROL_DISABLED', 'IEC-104 control is disabled on this HES');
     return;
   }
 
-  const validation = validateControlRequest(ws.principal, msg, controlPolicy);
+  const validation = await validateDatabaseControlRequest(ws.principal, msg);
+  if (ws.readyState !== WebSocket.OPEN) return;
   if (!validation.ok) {
     console.warn('[WS][CONTROL] Rejected:', {
       userId: ws.principal.userId,
@@ -398,7 +386,10 @@ function handleControlMessage(ws, msg) {
   try {
     const commandClient = new IEC104Client(device.ip, commonAddress, Number(device.port));
     commandClient.connect();
-    setTimeout(() => commandClient.sendFloatValue(command.ioa, command.value), 500);
+    setTimeout(() => {
+      if (command.type === 'C_SC_NA_1') commandClient.sendSingleCommand(command.ioa, command.value);
+      else commandClient.sendFloatValue(command.ioa, command.value);
+    }, 500);
 
     sendJson(ws, {
       type: 'CONTROL_ACCEPTED',

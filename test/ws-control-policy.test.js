@@ -60,3 +60,11 @@ test('IOA ngoài miền 24-bit IEC-104 bị từ chối', () => {
   assert.equal(result.ok, false);
   assert.equal(result.code, 'INVALID_CONTROL');
 });
+
+ test('single commands enforce type and binary value', () => {
+  const singlePolicy = {'366621': {'1': {type:'C_SC_NA_1', min:1, max:1}}};
+  const request = {deviceId:'366621',ioa:1,value:1,commandType:'C_SC_NA_1'};
+  assert.equal(validateControlRequest(principal(),request,singlePolicy).ok,true);
+  assert.equal(validateControlRequest(principal(),{...request,value:2},singlePolicy).ok,false);
+  assert.equal(validateControlRequest(principal(),{...request,commandType:'C_SE_NC_1'},singlePolicy).ok,false);
+});
